@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "Please cite this analysis and the associated manuscript RHE-25-1792.R2."
+title: "A specific molecular Profiling of Secreted Rheumatoid Factors in Sjögren’s disease patients with lymphoma"
+type: software
+repository-code: "https://github.com/atroel01/RHE-25-1792.R2"
+authors:
+  - family-names: Wang
+    given-names: Jing Jing
+  - family-names: Troelnikov
+    given-names: Alexander
+  - family-names: Armour
+    given-names: Bridie
+  - family-names: Teng
+    given-names: Caizhu
+  - family-names: Chataway
+    given-names: Tim
+  - family-names: le Guern
+    given-names: Véronique
+  - family-names: Hachulla
+    given-names: Eric
+  - family-names: Devauchelle-Pensec
+    given-names: Valérie
+  - family-names: Larroche
+    given-names: Claire
+  - family-names: Gottenberg
+    given-names: JE
+  - family-names: Mariette
+    given-names: Xavier
+  - family-names: Nocturne
+    given-names: Gaetane

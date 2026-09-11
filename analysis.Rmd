@@ -1,0 +1,1310 @@
+---
+title: "RF profiling in Sjögren’s disease with lymphoma"
+subtitle: "Rheumatology · Manuscript RHE-25-1792.R2"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+    code_folding: hide
+    theme: flatly
+    self_contained: true
+---
+
+This notebook is the single source of executable analysis. It starts from the
+curated inputs used by the supplied script and regenerates figures and tables.
+It does not rerun raw proteomics processing, structural docking or mCSM-ab2.
+After running the notebook, open the generated HTML to read the results; use the
+**Code** buttons to inspect each calculation. To rerun, follow `README.md`.
+
+## Environment and inputs
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+  error = FALSE, fig.width = 10, fig.height = 6, dpi = 150, dev.args = list(bg = "white"))
+options(scipen = 999, digits = 4)
+set.seed(1792)
+dir.create("outputs", showWarnings = FALSE)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(forcats)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(rstatix)
+library(ggpubr)
+library(MetBrewer)
+library(cowplot)
+library(egg)
+library(ggh4x)
+library(ggmsa)
+library(seqinr)
+library(ggbeeswarm)
+library(scales)
+# Resolve masked functions explicitly, independently of the user's workspace.
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+count <- dplyr::count
+desc <- dplyr::desc
+alpha <- ggplot2::alpha
+ggarrange <- ggpubr::ggarrange
+
+```
+
+```{r check-inputs}
+alignment_lines <- read_lines("data/rf_ighv_peptide_alignment.txt")
+stopifnot(length(alignment_lines) <= 999,
+          trimws(alignment_lines[350]) == "Non-lymphoma")
+```
+
+## 1. Decode peptide alignments
+
+Spaces are unobserved; dots match the reference; letters are residues. Explicit reference-matching letters are dropped by the parser.
+
+```{r analysis-1}
+get_contig_no<-function(string_of_aa_positions) {
+  length(string_of_aa_positions)->l
+  x = 2
+  s = 1
+  section = c(s)
+  while (x <= l) {
+    if (string_of_aa_positions[x]-string_of_aa_positions[x-1] == 1) {
+      section = append(section, s)
+    } else {
+      s = s + 1
+      section = append(section, s)
+    }
+    x = x + 1
+  }
+  return(section)
+}
+
+raw_seq_parser<-function(data_column, spacer_symbol,imgt_ref_long) {
+  data_raw<-na.omit(data_column)
+  arranged_table<-tibble()
+  for (i in 1:length(data_raw)) {
+    x<-data_raw[i]
+    
+    pt_code<-if_else(
+      str_detect(x,"^\\d"),
+      str_extract(x, "\\d+-\\d+"),
+      NA_character_
+    )
+    
+    sf<-if_else(str_detect(x,">"),str_extract(x,"(?<=IGHV)[\\d-_]+(?=|)") %>% str_to_lower(),NA_character_)
+    
+    string<-if_else(!str_detect(x,">|\\d"),x,NA_character_)
+    
+    arranged_table<-arranged_table %>% 
+      bind_rows(tibble(
+        read_unique_id=i,
+        pt_code=pt_code,
+        subfamily = sf,
+        string=string
+      ))
+  }
+  arranged_table<-arranged_table %>%
+    fill(c(pt_code, subfamily),.direction = "down") %>%
+    filter(!is.na(string))%>%
+    separate(
+      string,
+      sep = "",
+      into = paste0(seq.int(0,108,1))) %>%
+    select(-`0`) %>%
+    pivot_longer(
+      cols = c(`1`:`108`),
+      names_to = "aa_position",
+      values_to = "aa",
+      values_transform = list(
+        aa = as.character,
+        aa_position = as.numeric
+      )
+    ) %>%
+    filter(aa != spacer_symbol,!is.na(aa), aa != "") %>%
+    mutate(
+      subfamily = str_replace(subfamily,"_","*"),
+      aa = str_to_upper(aa),
+      aa_position = as.numeric(aa_position)) %>%
+    left_join(imgt_ref_long) %>%
+    filter(aa != aa_ref) %>% 
+    group_by(read_unique_id) %>% 
+    mutate(peptide_unique_id = paste0(read_unique_id,"-", get_contig_no(aa_position)))
+  
+  return(arranged_table)
+}
+
+pipe_print<-function(x) {
+  print(x)
+  return(x)
+}
+```
+
+## 2. Reference numbering
+
+Map the first 108 IMGT alignment columns to sequential residue positions.
+
+```{r analysis-2}
+read_imgt_ighv_fasta<-function(fasta_file){
+  imgt<-read.fasta(file = fasta_file,as.string = T,seqtype = "AA") %>% 
+    as_tibble()%>% t() %>% 
+    as_tibble(rownames = NA)
+  
+  imgt_rownames<-rownames(imgt)
+  
+  imgt_ref<-bind_cols(imgt_rownames,imgt) %>% as_tibble(rownames = NULL)
+  colnames(imgt_ref)<-c("ighv", "ref_seq")
+  
+  imgt_ref_long<-
+    imgt_ref %>% 
+    mutate(subfamily = str_extract(ighv,"(?<=IGHV)[\\d[[:punct:]]]+(?=|)"))%>%
+    separate(ref_seq,sep = "",into = paste0("aa_",seq.int(0,108,1))) %>% 
+    pivot_longer(
+      cols = dplyr::starts_with("aa"),
+      values_to = "aa_ref",
+      names_to = "imgt_pos",
+      values_transform = list(
+        aa_ref = as.character,
+        position =as.numeric
+      )) %>% 
+    mutate(imgt_pos = str_extract(imgt_pos, "\\d+") %>% as.numeric(),
+           is.gap = case_when(
+             str_detect(aa_ref, "\\.")~ "GAP",
+             TRUE ~ NA_character_
+           ))%>% 
+    dplyr::filter(imgt_pos !=0, !is.na(aa_ref), is.na(is.gap)) %>% 
+    group_by(subfamily) %>% 
+    mutate(aa_position = row_number()) %>% 
+    select(-is.gap,-ighv)
+  
+  return(imgt_ref_long)
+  
+}
+
+imgt_reference<-read_imgt_ighv_fasta("data/reference/imgt_ighv_reference.fasta")
+```
+
+## 3. Amino-acid properties
+
+Use the supplied amino-acid properties to score substitutions.
+
+```{r analysis-3}
+aa_characteristics_short<-read_csv("data/reference/amino_acid_properties.csv", show_col_types = FALSE) %>% 
+  select(1:4) %>% 
+  mutate(
+    Aromatic = case_when(
+      Code %in% c("F", "W", "Y") ~ "Aromatic",
+      TRUE ~ "Non-aromatic")
+    ) 
+
+aa_characteristics<- aa_characteristics_short%>% 
+  mutate(
+    Change_to = toString(Code),
+  ) %>% 
+  rename(
+    Change_from = Code,
+    Hydropathy_from = Hydropathy,
+    Charge_from = Charge,
+    Aromatic_from = Aromatic
+  ) %>% 
+  separate(Change_to,sep = ", ",into = paste0("col_",seq.int(1,20,1))) %>% 
+  pivot_longer(
+    cols = starts_with("col_"),
+    values_to = "Change_to", 
+    names_to = NULL) %>% 
+  left_join(aa_characteristics_short[,2:5] %>% 
+              rename(Hydropathy_to = Hydropathy,
+                     Charge_to = Charge,
+                     Aromatic_to = Aromatic),
+            by = c("Change_to" = "Code")
+            ) 
+
+aa_change_matrix<-aa_characteristics %>% 
+  mutate(
+    hy_change = case_when(
+      Hydropathy_from == Hydropathy_to ~ 0,
+      Hydropathy_to == "moderate" | Hydropathy_from == "moderate" ~ 0.5,
+      TRUE ~ 1
+    ),
+    ch_change = case_when(
+      Charge_from == Charge_to ~ 0,
+      Charge_to == "N" | Charge_from == "N" ~ 0.5,
+      TRUE ~ 1
+    ),
+    ar_change = case_when(
+      Aromatic_from == Aromatic_to ~ 0,
+      TRUE ~ 1
+    ),
+    change_vector = sqrt(hy_change^2+ch_change^2+ar_change^2),
+  ) %>% select(Change_from,Change_to,change_vector,hy_change,ch_change,ar_change)
+```
+
+## 4. Colour key
+
+The small TSV defines the seven residue groups. Colours come from the pinned ggmsa installation; the original use of its internal palette is retained.
+
+```{r analysis-4}
+zappo_colors = tibble(color = ggmsa:::scheme_AA$Zappo_AA,
+                      aa = rownames(ggmsa:::scheme_AA))
+
+aa_zappo <- read_tsv("data/reference/zappo_amino_acid_groups.tsv", col_names = c("X1", "X2"), show_col_types = FALSE) %>%
+  rename(group = X1, aa_ = X2) %>%
+  separate(col = aa_,
+           sep = "",
+           into = paste0("aa", seq.int(1, 10, 1))) %>%
+  pivot_longer(
+    starts_with("aa"),
+    values_drop_na = T,
+    names_to = NULL,
+    values_to = "aa"
+  ) %>%
+  filter(aa != "") %>%
+  mutate(r_num = row_number()) %>%
+  group_by(group) %>%
+  mutate(start = min(r_num) - 0.5, end  = max(r_num) + 0.5) %>%
+  left_join(zappo_colors)
+
+color_scale <- aa_zappo %>%
+  distinct(group, color)
+color_scale_zappo <- color_scale$color
+names(color_scale_zappo) <- color_scale$group
+
+color_scale_zappo %>% as.character()
+
+scale_zappo<- scale_discrete_manual(aesthetics = "fill", values = color_scale_zappo,name = "")
+```
+
+## 5. Study data and filtering
+
+Filter curated alignments at >1 observation and >10% mutation coverage; retain zero-count participants in summaries.
+
+```{r analysis-5}
+rf_data<-tibble(data = read_lines("data/rf_ighv_peptide_alignment.txt")) %>% 
+  mutate(data = str_replace_all(data,"\\s","@"))
+cryo_patients<-c("003-25", "003-27", "003-40","07-06", "07-12", "08-09")
+
+prelymphoma_patients<- c("01-32", "07-12", "07-35", "08-09", "15-24")
+ritux_treated<-c("01-06", "03-16", "07-06", "07-09", "07-33")
+
+rf_levels <- read_csv("data/rf_levels.csv", col_types = cols(pt = col_character(), rf_level = col_double()))
+vh_dominant <- read_csv("data/dominant_clones.csv", col_types = cols(.default = col_character()))
+
+results_shm<-raw_seq_parser(rf_data$data[1:349], spacer_symbol = "@",imgt_ref_long = imgt_reference) %>% 
+  mutate(Lymphoma = "Lymphoma") %>% 
+  bind_rows(raw_seq_parser(rf_data$data[350:999], spacer_symbol = "@",imgt_ref_long = imgt_reference)%>% 
+              mutate(Lymphoma = "Non Lymphoma")
+  )%>% 
+  rowwise() %>% 
+  mutate(pt = paste0(pt_code),
+         subfamily = str_extract(subfamily, "\\d-\\d{1,2}"),
+         .keep = "unused"
+         ) %>% 
+  ungroup() %>% 
+  group_by(subfamily,Lymphoma) %>% 
+  mutate(pts_per_group_and_subfamily = n_distinct(pt)) %>% 
+  group_by(pt, subfamily, imgt_pos) %>% 
+  mutate(coverage_count = n()) %>% 
+  ungroup() %>% 
+  mutate(Cryoglobulin = case_when(
+    pt %in% cryo_patients ~ "Cryo",
+    TRUE ~ "No Cryo"
+    ),
+  `Pre-Lymphoma` = case_when(
+    pt %in% prelymphoma_patients ~ "Pre Lymphoma",
+    TRUE ~ Lymphoma
+  ),
+  `Current Lymphoma` = case_when(
+    `Pre-Lymphoma` == "Lymphoma" ~ "Yes",
+    TRUE ~ "No"
+  ),
+  `Pre-Lymphoma` = fct(`Pre-Lymphoma`,levels = c("Lymphoma","Pre Lymphoma","Non Lymphoma")),
+  `B cell depletion` = case_when(
+    pt %in% ritux_treated ~ "Ritux",
+    TRUE ~ "No Ritux"
+  ))
+
+summarised_sf_table = results_shm %>% 
+  select(pt,subfamily,Lymphoma) %>% 
+  distinct() %>% 
+  group_by(pt) %>% 
+  summarise(subfamilies = toString(subfamily),sf_count = n())
+
+pt_summary <- summarised_sf_table %>% left_join(
+  results_shm %>%
+    distinct(
+      pt,
+      Lymphoma,
+      Cryoglobulin,
+      `Pre-Lymphoma`,
+      `Current Lymphoma`,
+      `B cell depletion`
+    )) %>% 
+  left_join(rf_levels) %>% 
+  left_join(vh_dominant) %>% 
+  mutate(
+    dominant = dominant %>% str_to_lower(),
+    dominant_sf = case_when(
+      str_detect(dominant, "^dominant") ~ "1-69",
+      str_detect(dominant, "biclonal") ~ subfamilies,
+      TRUE ~ str_extract(dominant,"\\d-\\d+")
+    )
+  )
+
+shm_changes<-results_shm %>% 
+  select(-contains("unique_id")) %>% 
+  filter(
+    aa != ".",
+  ) %>% 
+  group_by(pt,subfamily,imgt_pos,aa) %>%
+  mutate(specific_aa_mut_coverage = n()) %>%
+  ungroup() %>% 
+  group_by(pt,subfamily,imgt_pos) %>% 
+  mutate(any_aa_mut_coverage = n()) %>% 
+  ungroup() %>%
+  mutate(
+    specific_mut_proportion=specific_aa_mut_coverage/coverage_count,
+    any_mut_proportion = specific_aa_mut_coverage/coverage_count
+  ) %>% 
+  left_join(aa_characteristics %>% 
+              left_join(aa_change_matrix), 
+            by = join_by(aa_ref == Change_from, aa == Change_to)
+  ) %>% 
+  mutate(
+    Hydrophobic_change = case_when(
+      Hydropathy_to == "moderate" & Hydropathy_from =="hydrophilic" ~ "hydrophobic",
+      Hydropathy_to == "moderate" & Hydropathy_from =="hydrophobic" ~ "hydrophilic",
+      Hydropathy_from != Hydropathy_to ~ Hydropathy_to,
+      TRUE ~ "Unchanged"
+    ) %>% str_to_sentence(),
+    Charge_change = case_when(
+      Charge_to == "N" & Charge_from =="-" ~ "Positive",
+      Charge_to == "N" & Charge_from =="+" ~ "Negative",
+      Charge_from != Charge_to ~ Charge_to,
+      TRUE ~ "Unchanged"
+    )%>% str_to_sentence(),
+    Charge_change = case_when(
+      Charge_change == "-" ~ "Negative",
+      Charge_change == "+" ~ "Positive",
+      Charge_change == "N" ~ "Neutral",
+      TRUE ~ Charge_change
+    )
+  ) %>% 
+  distinct()
+
+complete_data<-pt_summary %>% 
+  separate(
+    subfamilies,
+    into = paste0("_SF",seq.int(1,10,1)),
+    sep = ","
+  ) %>% 
+  pivot_longer(
+    cols = starts_with("_SF"),
+    values_transform = str_trim,
+    values_drop_na = T,
+    values_to = "subfamily",
+    names_to = NULL
+  ) %>% 
+  left_join(
+    shm_changes,
+  ) 
+
+filtered_data <- complete_data %>%
+  ungroup() %>%
+  filter(
+    specific_aa_mut_coverage > 1,
+    specific_mut_proportion > 0.1
+  ) %>%
+  mutate(kept = 1L)
+
+p_rf_level<-pt_summary %>% ggplot()+
+  aes(x = `Pre-Lymphoma`, y = rf_level)+
+  geom_boxplot(outliers = FALSE)+
+  geom_beeswarm(aes(shape = interaction(Cryoglobulin,`B cell depletion`,sep = "+\n",drop = T)),alpha = 1,cex = 3,size=3)+
+  geom_pwc(p.adjust.method = "bonferroni",label = "p.adj.signif",hide.ns = F)+
+  egg::theme_article(base_size = 11)+
+  facet_wrap(vars("Rheumatoid factor level"))+
+  scale_shape_manual(values = c(20,17,18,15),name = "")+
+  guides(shape = guide_legend(direction = "horizontal",nrow = 1))+
+  ylab("IU/L")+
+  theme(legend.position = 'bottom',
+        axis.title.x = element_blank(),
+        strip.text = element_text(size = 10,face = "bold"),
+        legend.direction = "vertical")
+p_rf_level
+
+# Report qualifying counts separately from unfiltered records.
+supplemental_data <- complete_data %>%
+  ungroup() %>%
+  group_by(pt, subfamily, rf_level, Lymphoma, `Pre-Lymphoma`,
+           `B cell depletion`, Cryoglobulin) %>%
+  summarise(unfiltered_record_count = n(), .groups = "drop") %>%
+  left_join(filtered_data %>% ungroup() %>%
+              count(pt, subfamily, name = "qualifying_mutation_count"),
+            by = c("pt", "subfamily")) %>%
+  mutate(qualifying_mutation_count = replace_na(qualifying_mutation_count, 0L))
+stopifnot(sum(supplemental_data$qualifying_mutation_count) == nrow(filtered_data))
+write_csv(supplemental_data, "outputs/supplemental_data_table.csv")
+
+```
+
+## 6. Figure 1 — RF levels and IGHV repertoire
+
+RF levels (IU/L), IGHV subfamilies and repertoire proportions.
+
+```{r analysis-6}
+repertoire_p1<-results_shm %>% 
+  select(pt,subfamily,`Pre-Lymphoma`, `B cell depletion`) %>% 
+  distinct() %>% 
+  ggplot()+
+  aes(x = pt, y = fct_infreq(subfamily), group = `Pre-Lymphoma` , 
+      fill = `B cell depletion`)+
+  geom_tile(alpha = 1, 
+            lwd = 0.7,height = 0.8, width = 0.8)+
+  scale_fill_met_d(name = "Hokusai2")+
+  geom_tile(
+    data = pt_summary %>% 
+      select(pt,dominant_sf,`Pre-Lymphoma`) %>% 
+      separate(dominant_sf,into = paste0("dsf_",seq_len(3)), sep = ", ") %>%
+      pivot_longer(cols = starts_with("dsf_"),names_to = NULL,values_to = "dominant_sf",values_drop_na = T) %>% 
+      mutate(color_lab = "Dominant"),
+      aes(
+        x = pt, y = dominant_sf, color = color_lab,fill = "transparent"
+      ), 
+    fill = "transparent",
+    height = 0.8, 
+    width = 0.8, 
+    linewidth = 1,show.legend = T,inherit.aes = T)+
+  scale_color_manual(values = c("black"))+
+  facet_grid(cols = vars(fct_inorder(`Pre-Lymphoma`)),scales = "free_x",space = "free_x")+
+  egg::theme_article(base_size = 11)+
+  guides()+
+  background_grid()+
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+    axis.text.x = element_text(angle = 90), 
+    axis.title.x = element_blank(),
+    strip.text = element_text(size = 10,face = "bold"),
+    )+
+  ylab("IGHV Subfamily")
+
+repertoire_p1
+
+repertoire_p2<-pt_summary%>%
+  ggplot()+
+  aes(x = `Pre-Lymphoma`, y = sf_count)+
+  geom_boxplot(outlier.shape = NULL)+
+  geom_beeswarm(
+    aes(shape = interaction(
+      Cryoglobulin,
+      `B cell depletion`,
+      sep = "\n+\n",
+      drop = T
+    )),
+    alpha = 1,
+    cex = 3,
+    size = 3,corral.width = 1
+  )+
+  scale_shape_manual(values = c(20,17,18,15),name = "")+
+  guides(shape = guide_none())+
+  geom_pwc(bracket.nudge.y = 0.1,p.adjust.method = "bonferroni",label = "p.adj.signif", hide.ns = T)+
+  scale_y_continuous(expand = expansion(add = c(1,1)))+
+  scale_fill_met_d("Egypt")+
+  facet_wrap(vars("VH Subfamily Count"))+
+  ylab("No. Subfamilies")+
+  egg::theme_article(base_size = 11)+
+  theme(legend.title = element_blank(),
+        axis.title.x = element_blank(),
+        strip.text = element_text(size = 10,face = "bold"),
+  )
+repertoire_p2
+
+p_1_3_data<-pt_summary %>% 
+  mutate(
+    Other = ifelse(str_detect(subfamilies,"1-69"),sf_count-1,sf_count),
+    `IGHV1-69` = ifelse(str_detect(subfamilies,"1-69"),1,0)) %>% 
+  pivot_longer(c("Other",`IGHV1-69`),names_to = "n_sf",values_to = "value") %>% 
+  group_by(`Pre-Lymphoma`,n_sf) %>% 
+  summarise(n_ = sum(value)) 
+p_1_3_stats = p_1_3_data%>% 
+  pivot_wider(names_from = "n_sf",values_from = "n_",values_fn = as.numeric) %>% 
+  column_to_rownames("Pre-Lymphoma") %>% 
+  pairwise_fisher_test(p.adjust.method = "bonferroni") %>% 
+  filter(p.adj < 0.05)
+
+p_1_3<-p_1_3_data %>% 
+  mutate(n_sf = factor(n_sf) %>% fct_rev()) %>% 
+  arrange() %>% 
+  ggplot(aes(x = `Pre-Lymphoma`,y = n_,fill = n_sf,label = n_sf))+
+  geom_col(position = position_fill(),alpha = 0.8,color = "black")+
+  geom_text(position = position_fill(vjust = 0.5),size = 3)+
+  scale_y_continuous(labels = function(x) scales::percent(x),expand = expansion(mult = c(0,0.2)),breaks = c(0,0.25,0.50,0.75,1))+
+  ylab("Proportion")+
+  facet_wrap(vars("Proportion of subfamilities"))+
+  scale_fill_manual(values = met.brewer(name = "VanGogh3",2))+
+  egg::theme_article(base_size = 11)+
+  geom_bracket(
+    aes(xmin = group1, xmax = group2, label = signif(p.adj, 2)),
+    data = p_1_3_stats, y.position = 1.05,inherit.aes = F,
+    step.increase = 0.003,tip.length = c(0.001,0.001)
+  )+
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        strip.text = element_text(size = 10,face = "bold"),
+  )
+p_1_3
+
+# Use portable default sans-serif fonts.
+plot_1<-plot_grid(
+  plot_grid(
+    p_rf_level,
+    repertoire_p1,
+    labels = c("A","B"),
+    rel_widths = c(5,7),
+    nrow = 1),
+  plot_grid(
+    repertoire_p2,
+    p_1_3,
+    ggplot() + theme_void(),
+    nrow = 1,
+    rel_widths = c(5,5,2),
+    labels = c("C","D","")),
+  ncol = 1,
+  rel_heights = c(0.7,0.5))
+
+plot_1
+
+ggsave("outputs/Fig1.png",plot_1,dpi = 300,width = 9.5,height = 6,bg = "white")
+```
+
+## 7. Figure 2 — mutation summaries
+
+Summarise mutations using cohort, participant and peptide ID together.
+
+```{r analysis-7}
+shm_number <- pt_summary %>%
+  ungroup() %>%
+  select(`Pre-Lymphoma`, pt, sf_count, `B cell depletion`, rf_level) %>%
+  left_join(
+    filtered_data %>%
+      count(pt, name = "shm_count"),
+    by = "pt"
+  ) %>%
+  mutate(
+    shm_count = coalesce(shm_count, 0L),
+    number_of_shm_per_sf = shm_count / sf_count
+  )
+
+shm_num_total_p<-shm_number %>%
+  ggplot()+
+  aes(x = `Pre-Lymphoma`, y = shm_count)+
+  geom_boxplot(outlier.shape = NULL,outlier.colour = "transparent")+
+  geom_beeswarm(cex=2,aes(fill = `B cell depletion`))+
+  scale_fill_grey()+
+  egg::theme_article(base_size = 11)+
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        strip.text = element_text(size = 10,face = "bold"),
+        )+
+  ylab("AA changes, N")+
+  geom_pwc(group.by = "x.var",bracket.nudge.y = 0.1,hide.ns = T)+
+  scale_y_continuous(expand = expansion(mult = c(0.1,0.1)))+
+  facet_grid(cols = vars("SHMs Total"))
+shm_num_total_p
+
+shm_num_persf_p<-shm_number %>% 
+  ggplot()+
+  aes(x = `Pre-Lymphoma`, y = number_of_shm_per_sf)+
+  geom_boxplot(outlier.shape = NULL,outlier.colour = "transparent")+
+  geom_beeswarm(cex=2,aes(shape=`B cell depletion`),size =3)+
+  egg::theme_article(base_size = 11)+
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        strip.text = element_text(size = 10,face = "bold"),
+  )+
+  ylab("AA changes, N")+
+  geom_pwc(group.by = "x.var",bracket.nudge.y = 0.1,hide.ns = T)+
+  scale_y_continuous(expand = expansion(mult = c(0.1,0.1)))+
+  facet_grid(cols = vars("SHMs per Subfamily"))
+shm_num_persf_p
+
+shm_number_1_69_only <- complete_data %>%
+  ungroup() %>%
+  filter(subfamily == "1-69") %>%
+  distinct(`Pre-Lymphoma`, pt, sf_count, `B cell depletion`, rf_level) %>%
+  left_join(
+    filtered_data %>%
+      filter(subfamily == "1-69") %>%
+      count(pt, name = "shm_count"),
+    by = "pt"
+  ) %>%
+  mutate(shm_count = coalesce(shm_count, 0L))
+
+p_shm_number_1_69_only<-shm_number_1_69_only %>% 
+  ggplot()+
+  aes(x = `Pre-Lymphoma`, y = shm_count)+
+  geom_boxplot(outlier.shape = NULL,outlier.colour = "transparent")+
+  geom_beeswarm(cex = 2,aes(shape = `B cell depletion`),size = 3)+
+  egg::theme_article(base_size = 11)+
+  theme(legend.position = "right",
+        legend.title = element_blank(),
+        axis.title.x = element_blank(),
+        strip.text = element_text(size = 10,face = "bold"),
+  )+
+  ylab("AA changes, N")+
+  geom_pwc(group.by = "x.var",bracket.nudge.y = 0.1,hide.ns = T)+
+  scale_y_continuous(expand = expansion(mult = c(0.1,0.1)))+
+  facet_grid(cols = vars("IGHV1-69"))
+p_shm_number_1_69_only
+
+d_mutations_per_peptide <- results_shm %>%
+  filter(coverage_count > 1) %>%
+  group_by(Lymphoma, pt, peptide_unique_id) %>%
+  mutate(
+    mutations_per_peptide = sum(aa != ".") / n()
+  ) %>%
+  distinct(Lymphoma, pt, peptide_unique_id, .keep_all = TRUE) %>%
+  ungroup()
+
+p_mutations_per_peptide<-d_mutations_per_peptide %>% 
+  bind_rows(d_mutations_per_peptide %>% mutate(subfamily = "all")) %>% 
+  group_by(subfamily) %>% 
+  filter(n_distinct(`Pre-Lymphoma`)>1) %>% 
+  ggplot(aes(x = subfamily, y = mutations_per_peptide, color =  `Pre-Lymphoma`) )+
+  geom_beeswarm(dodge.width = 1,corral = 'random',corral.width = 0.2,size=1,alpha=0.5)+
+  geom_boxplot(position = position_dodge(width = 1),width=0.4,alpha=0.7)+
+  geom_pwc(group.by = 'x.var',dodge = 1,hide.ns = T,label = "p.adj.signif",step.increase = 0.2)+
+  facet_wrap(vars(subfamily),scales="free_x",nrow = 1)+
+  egg::theme_article(base_size = 11)+ 
+  scale_color_viridis_d(end = 0.8)+
+  scale_y_continuous(expand = expansion(mult = c(0.1,0.2)))+
+  ylab(str_wrap("Proportion of peptide mutated",20))+
+  theme(legend.position = "right",
+        legend.title = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+        strip.text = element_text(size = 10,face = "bold"),
+  )
+p_mutations_per_peptide 
+
+d_mutations_per_peptide %>% 
+  ggplot()+
+  aes(x = pt, y = mutations_per_peptide, color = `Pre-Lymphoma`)+
+  geom_boxplot()+
+  facet_wrap(vars(subfamily))
+```
+
+## 8. Figure 3 — antibody alignments and predicted affinity
+
+Align heavy/light sequences with MUSCLE and read the five precomputed mCSM-ab2 scans.
+
+```{r analysis-8, fig.width=20, fig.height=7}
+seq_names = c(
+  "07-12",
+  "07-06",
+  "003-27",
+  "003-40",
+  "YES8c",
+  "Germline"
+)
+
+heavy_chain <- Biostrings::readAAStringSet("data/sequences/heavy_chain.fasta")
+names(heavy_chain)<-seq_names
+
+heavy_chain_aligned <- msa::msa(heavy_chain,method = "Muscle") %>% Biostrings::AAStringSet()
+
+light_chain <- Biostrings::readAAStringSet("data/sequences/light_chain.fasta")
+
+names(light_chain)<-seq_names
+
+light_chain_aligned <- msa::msa(light_chain,method = "Muscle") %>% Biostrings::AAStringSet()
+
+ 
+
+msa_data = list()
+msa_data[["heavy_chain"]][["seq"]] = heavy_chain
+msa_data[["light_chain"]][["seq"]] = light_chain
+msa_data[["heavy_chain"]][["aligned"]] = heavy_chain_aligned
+msa_data[["light_chain"]][["aligned"]] = light_chain_aligned
+
+for (i in 1:length(msa_data)) {
+  sequences = msa_data[[i]][["seq"]]
+  chain_not_germline = sequences[names(sequences) != "Germline"]
+  germline = sequences[names(sequences) == "Germline"]
+  stopifnot(length(germline) == 1)
+  
+  germline_seq = germline[[1]] %>% as.character() %>% str_split_1("")
+  
+  msa_data[[i]][["mutations"]] = chain_not_germline %>% 
+    as.list() %>% 
+    map(
+      ~{as.character(.x) %>% substr(start = 1,stop = length(germline_seq)) %>% str_split_1("") %>% {which(germline_seq != .)}}
+    )
+}
+
+ddg_files <- sort(list.files("data/mcsm_ab2", pattern = "_affinity_scan[.]csv$", full.names = TRUE))
+stopifnot(length(ddg_files) == 5)
+
+for (file in 1:length(ddg_files)) {
+  
+  filename = ddg_files[file]
+  clean_name <- sub("_affinity_scan[.]csv$", "", basename(filename))
+  
+  data = read_csv(filename)%>% 
+    select(DDG:outcome)%>% 
+    mutate(DDG = DDG)
+  
+  msa_data[["heavy_chain"]][["ddg"]][[clean_name]] = data %>% filter(chain == "H") 
+  msa_data[["light_chain"]][["ddg"]][[clean_name]] = data %>% filter(chain == "L") 
+  
+  chains = names(msa_data)
+  
+  for (c in 1:length(chains)) {
+    
+    chain_cur = chains[c]
+    aligned_chain_seq = msa_data[[chain_cur]][["aligned"]][[clean_name]] %>% as.character()
+    alignment_breaks = {gregexpr(pattern ='-',aligned_chain_seq)[[1]]} %>% as.numeric() %>% base::sort(decreasing = F)
+    current_ddg_table = {msa_data[[chain_cur]][["ddg"]][[clean_name]]} 
+    current_ddg_table = current_ddg_table%>% mutate(position_aligned = position)
+    
+    for(b in 1:length(alignment_breaks)) {
+      a_break = alignment_breaks[b]
+      
+      current_ddg_table = current_ddg_table %>% 
+        mutate(position_aligned = case_when(
+          a_break == -1 ~ position_aligned,
+          position_aligned >= a_break ~ position_aligned +1,
+          TRUE ~ position_aligned
+        ))
+    }
+    msa_data[[chain_cur]][["ddg_aligned"]][[clean_name]] = current_ddg_table
+    
+    msa_data[[chain_cur]][["ddg_summary"]][[clean_name]] = current_ddg_table %>% 
+      group_by(position,position_aligned) %>% 
+      summarise(DDG_mean = mean(DDG),DDG_median = median(DDG))
+    
+    msa_data[[chain_cur]][["contacts"]][[clean_name]] = current_ddg_table$position_aligned %>% 
+      unique() %>% 
+      sort()
+    
+    mutations = msa_data[[chain_cur]][["mutations"]][[clean_name]]
+    chain_seqs = msa_data[[chain_cur]][["seq"]]
+    chain_seqs_s = chain_seqs[names(chain_seqs) == "Germline"] %>% 
+      as.character() %>% 
+      str_split_1("")
+    
+    msa_data[[chain_cur]][["mut_ddg"]][[clean_name]] = tibble(
+      chain_c = chain_cur,
+      position = mutations,
+      mutant = chain_seqs_s[mutations]
+    ) %>% 
+      left_join(msa_data[[chain_cur]][["ddg_aligned"]][[clean_name]]) %>% 
+      filter(!is.na(DDG))
+    
+  }
+}
+
+msa_graph_data = list(
+  hc = list(
+    sequence = msa_data[["heavy_chain"]][["aligned"]],
+    cutpoint = list(c(25,33),c(50,58),c(96,113)),
+    mut_ddg  = msa_data[["heavy_chain"]][["mut_ddg"]], 
+    contacts = msa_data[["heavy_chain"]][["contacts"]],
+    sum_ddg = msa_data[["heavy_chain"]][["ddg_summary"]]
+  ),
+  lc = list(
+    sequence = msa_data[["light_chain"]][["aligned"]],
+    cutpoint = list(c(26,33),c(50,53),c(89,98)),
+    mut_ddg  = msa_data[["light_chain"]][["mut_ddg"]], 
+    contacts = msa_data[["light_chain"]][["contacts"]],
+    sum_ddg = msa_data[["light_chain"]][["ddg_summary"]]
+  )
+)
+
+make_msa_graph<-function(msa_cdr_list){
+  out_graph_list <- list()
+  for (chain in 1:length(msa_cdr_list)) {
+    sequence = msa_cdr_list[[chain]][["sequence"]]
+    CDR_cuts = msa_cdr_list[[chain]][["cutpoint"]]
+    contact_resi = msa_cdr_list[[chain]][["contacts"]]
+    sum_ddg = msa_cdr_list[[chain]][["sum_ddg"]]
+    spec_ddg = msa_cdr_list[[chain]][["mut_ddg"]]
+    
+    p_msa<-ggmsa(
+      sequence,
+      consensus_views = T,
+      seq_name = T,
+      by_conservation = F,
+      ref = "Germline",
+      color = "Zappo_AA",
+      char_width = 0.7, 
+      border = "transparent",
+      use_dot = T
+    )+
+      egg::theme_article(base_size = 11)+
+      scale_x_continuous(expand = expansion(add = c(0.5,2)),breaks = scales::breaks_width(5))+
+      scale_y_discrete(expand = expansion(add = c(0,3.5)))
+    
+    for (i in 1:length(msa_cdr_list[[chain]][["sequence"]])) {
+      data_ = tibble(
+        x_ = seq.int(
+          1,
+          length(msa_cdr_list[[chain]][["sequence"]][[i]]))
+      ) %>% 
+        mutate(y_ = names(msa_cdr_list[[chain]][["sequence"]][i]))
+      
+      p_msa<-p_msa +
+        geom_tile(
+          data = data_,
+          aes_(x = data_$x_, y = data_$y_),
+          inherit.aes = F,
+          linewidth = 0.6, 
+          color = "white", fill = "transparent",width = 1, height = 1)
+    }
+    
+    for (i in 1:length(CDR_cuts)) {
+      
+      p_msa<-p_msa +
+        geom_vline(xintercept = min(CDR_cuts[[i]])+0.5,linewidth=0.5,linetype = 2)+
+        geom_vline(xintercept = max(CDR_cuts[[i]])+0.5,linewidth=0.5,linetype = 2)+
+        geom_rect(fill = "grey20",
+                  aes_(
+                    xmin = min(CDR_cuts[[i]])+0.5,
+                    xmax = max(CDR_cuts[[i]])+0.5,
+                    ymin = -1,
+                    ymax = 6), alpha = 0.1
+        )+
+        geom_text(aes_(
+          x = mean(CDR_cuts[[i]])+0.5,
+          y = 8,
+          label = paste0("CDR",i)
+        ))
+    }
+    
+    for (i in 1:length(contact_resi)) {
+      name_ = contact_resi[i] %>% names()
+      msa_temp_data = tibble(
+        position_aligned = contact_resi[[i]]
+      ) %>% 
+        mutate(
+          name = name_
+        ) %>% 
+        left_join(spec_ddg[[name_]])
+      
+      p_msa<-p_msa +
+        geom_tile(
+          aes_(
+            x = msa_temp_data$position_aligned,
+            y = msa_temp_data$name,
+            color = msa_temp_data$DDG
+          ),
+          fill = "transparent",
+          width = 0.8, height = 0.1, position = position_nudge(y=-0.5),
+          linewidth = 1,
+          linetype = 1,
+          inherit.aes = F)+
+        scale_color_gradient2(
+          low = "red",
+          mid = "grey70",
+          midpoint = 0,
+          high = "blue",
+          na.value = "black",
+          name = "ddG",
+          breaks = c(-2,0,2),
+          limits = c(-2,2),
+          oob = scales::squish,
+          minor_breaks = NULL,
+          labels = c("Reduce","0", "Increase"),
+        )+
+        theme(legend.text = element_text(vjust = 0.5),legend.title = element_text(vjust = 0.8))
+    }
+    sum_ddg_comb = tibble()
+    for (d in 1:length(sum_ddg)) {
+      sum_ddg_comb = sum_ddg_comb %>% bind_rows(
+        sum_ddg[[d]] %>% mutate(name = names(sum_ddg[d]))
+      )
+    }
+    
+    ddg_comb = sum_ddg_comb %>% 
+      group_by(position_aligned) %>% 
+      filter(!is.na(DDG_mean)) %>% 
+      summarise(ddg_mean_all = mean(DDG_mean))
+    
+    p_msa<-p_msa +
+      geom_tile(
+        aes_(
+          x = ddg_comb$position_aligned,
+          y = 0,
+          fill = ddg_comb$ddg_mean_all
+        ),
+        color = "black",
+        width = 0.9, 
+        height = 0.9,
+        linewidth = 0.1,
+        linetype = 1,
+        inherit.aes = F,
+        show.legend = F,position = position_nudge(y = -0.5))+
+      scale_fill_gradient2(
+        low = "red",
+        mid = "grey70",
+        midpoint = 0,
+        high = "blue",
+        na.value = "black",
+        name = "ddG",
+        breaks = c(-2,0,2),
+        oob = scales::squish,
+        limits = c(-2,2),
+        minor_breaks = NULL,
+        labels = c("Reduce","0", "Increase")
+      )
+    
+    
+    out_graph_list[[chain]]<-p_msa
+    
+  }
+  
+  ggpubr::ggarrange(plotlist = out_graph_list,ncol = 1,labels = LETTERS,common.legend = T)
+}
+
+make_msa_graph(msa_graph_data)->msa_graph
+msa_graph
+ggsave2("outputs/Fig3.png",msa_graph,bg = "white",dpi = 600,width = 20,height = 7)
+```
+
+## 9. Figure 2 — hotspot panel and assembly
+
+Panel D shows substitutions observed in more than two participants across the lymphoma groups; asterisks mark YES8c contacts.
+
+```{r analysis-9}
+d_mutation_hot_spots <- filtered_data %>%
+  filter(subfamily == "1-69") %>%
+  group_by(aa_position, aa, Lymphoma, aa_ref) %>%
+  summarise(count = n_distinct(pt)) %>%
+  group_by(aa_position,aa) %>% 
+  filter(sum(count)> 2) %>%
+  mutate(position = case_when(
+    Lymphoma == "Lymphoma" ~ count+1,
+    TRUE ~ -count-1
+  ))%>% 
+  left_join(aa_zappo, join_by(aa)) %>%
+  arrange(aa_position) %>%
+  left_join(aa_zappo %>% 
+              select(group, aa, color) %>% 
+              dplyr::rename(c(
+                ref_group = "group", 
+                ref_color = "color")),
+            join_by(aa_ref == aa)) %>% 
+  mutate(label=as_factor(paste0(aa_ref,fct_inseq(fct(as.character(aa_position))))))
+
+reference_labels=d_mutation_hot_spots %>% 
+  ungroup() %>% 
+  select(aa_ref,ref_group,label) %>% 
+  mutate(position = 1,Lymphoma = 'Reference') %>% 
+  distinct(label,.keep_all = T)
+
+contacts = msa_data$heavy_chain$contacts$YES8c
+
+plot2_mutation_hot_spots=d_mutation_hot_spots %>% 
+  ggplot(aes(
+    y = position,
+    x = label,
+    label = paste0(aa, ": ", abs(count)),
+    fill = group,
+    group = aa
+  )) +
+  geom_col(
+    size = 10,
+    position = position_dodge(),
+    color = "black",
+    linewidth = 0.5
+  ) +
+  geom_text(aes(hjust = ifelse(Lymphoma=="Lymphoma",-0.5,1.5)),color = "black", position = position_dodge(width = 0.8),size=3,angle = 90) +
+  geom_text(data=data.frame(),aes(x = 3, y = 10, label = "Lymphoma"),inherit.aes = F,size = 4)+
+  geom_text(data=data.frame(),aes(x = 3, y = -10, label = "Non-Lymphoma"),inherit.aes = F,size = 4)+
+  geom_box(inherit.aes = F,show.legend = F,
+           data = reference_labels,
+           linewidth = 1,
+           color = "black",
+           aes(
+             ymin = position,
+             ymax = -position,
+             x = label,
+             fill = ref_group,
+             width = 0.9,
+           )) +
+  geom_text(data = reference_labels,
+            aes(label = ifelse(str_extract(label,"\\d+") %>% as.numeric() %in% msa_data$heavy_chain$contacts$YES8c, paste0(label,"*"), paste0(label)),
+                y = 0,x=label),size = 3,inherit.aes = F)+
+  scale_y_continuous(labels = abs,expand = expansion(add = 3)) +
+  scale_zappo +
+  theme_pubr(legend = "bottom",base_size = 10) +
+  theme(
+    axis.text = element_blank(),
+    axis.line = element_blank(),
+    axis.ticks = element_blank(),
+    legend.text = element_text(size = 8),
+    panel.border = element_rect(color = "black", size = 0.5,fill = "transparent")
+    )+
+  guides(fill = guide_legend(nrow = 1),
+         y = guide_axis_truncated(
+           trunc_lower = c(-Inf,1),
+           trunc_upper = c(1,Inf)
+         ))+
+  ylab("") + xlab("AA number(sequential)")
+plot2_mutation_hot_spots
+
+plot_grid(
+  plot_grid(
+    plot_grid(
+      shm_num_persf_p,
+      p_shm_number_1_69_only,
+      labels = c("A","B"),
+      align = "h",
+      axis = "lr",
+      nrow = 1,
+      rel_widths = c(0.8, 1)
+    ),
+    plot_grid(
+      p_mutations_per_peptide,
+      labels = "C"
+    ),
+    ncol = 1
+  ),
+  plot2_mutation_hot_spots,
+  labels = c("", "D"),
+  align = "",
+  axis = "tb",
+  ncol = 1,
+  rel_heights = c(1, 0.8)
+  
+) -> plot_2
+
+plot_2
+
+ggsave2("outputs/Fig2.png",plot_2,bg = "white"
+      ,dpi = 600,width = 10,height = 8)
+```
+
+## 10. Figure 4A — interface-associated mutations
+
+Compare mutation counts using the union of heavy-chain contacts from five models. Figure 4B is not implemented in the supplied script.
+
+```{r analysis-10}
+extended_contacts = tibble()
+all_contacts = msa_graph_data$hc$contacts
+for (d in 1:length(all_contacts)) {
+  extended_contacts = extended_contacts %>% bind_rows(tibble(
+    contact = all_contacts[[d]]
+  ) %>% mutate(name = names(all_contacts[d]))
+  )
+}
+
+interface_counts <- filtered_data %>%
+  filter(subfamily == "1-69") %>%
+  mutate(
+    interfacial = if_else(
+      aa_position %in% unique(extended_contacts$contact),
+      "Antigen binding",
+      "Non-interfacing"
+    )
+  ) %>%
+  count(pt, interfacial, name = "count")
+
+interface_data <- tidyr::crossing(
+  complete_data %>%
+    ungroup() %>%
+    filter(subfamily == "1-69") %>%
+    distinct(`Pre-Lymphoma`, pt),
+  interfacial = c("Antigen binding", "Non-interfacing")
+) %>%
+  left_join(interface_counts, by = c("pt", "interfacial")) %>%
+  mutate(count = coalesce(count, 0L))
+
+fig_4 <- interface_data %>%
+  ggplot() +
+  aes(x = interfacial,y = count, color = `Pre-Lymphoma`)+
+  geom_boxplot(position = position_dodge(width = 0.9))+
+  geom_beeswarm(dodge.width = 0.9,size = 2,cex = 2)+
+  scale_color_viridis_d(end = 0.8)+
+  geom_pwc(p.adjust.method = "none", hide.ns = T)+
+  egg::theme_article(base_size = 11) +
+  ylab("Mutation Count")+
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.text = element_text(size = 8),
+    legend.title = element_blank(),
+    axis.title.x = element_blank()
+  )+
+  facet_wrap(vars("VH1-69 RF mutated residues"))
+fig_4
+# Figure 4B structural panels are not defined by the supplied script.
+ggsave("outputs/Fig4A.png", bg = "white", fig_4, width = 9, height = 4, dpi = 300)
+```
+
+## 11. Supplementary analyses
+
+Compare mutation properties and the 23 supplied HCDR3 sequences.
+
+```{r analysis-11, fig.width=12, fig.height=9}
+##### SUPP 1: Charge and Hydro####
+
+hydro_p<-filtered_data %>%
+  ggplot()+
+  aes(x = `Pre-Lymphoma`,fill = Hydrophobic_change,label = Hydrophobic_change)+
+  geom_bar(position = position_fill())+
+  scale_y_continuous(labels = function(x) percent(x))+
+  theme_pubr()+
+  theme(legend.position = "bottom",
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 8),
+        strip.text = element_text(size = 10,face = "bold"),
+  )+
+  ylab("Proportion")+
+  facet_grid(cols = vars("Hydrophobicity change"))+
+  scale_fill_met_d("Egypt",direction = -1)
+hydro_p
+
+charge_p<-filtered_data %>% 
+  filter(subfamily == "1-69") %>%
+  group_by(`Pre-Lymphoma`,Charge_change) %>% 
+  mutate(label = n()) %>% 
+  ggplot()+
+  aes(x = `Pre-Lymphoma`,fill = Charge_change,label = label)+
+  geom_bar(position = position_fill())+
+  scale_y_continuous(labels = function(x) percent(x))+
+  theme_pubr()+
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text.x = element_text(size = 8),
+        strip.text = element_text(size = 10,face = "bold"),
+  )+
+  coord_flip()+
+  facet_grid(cols = vars("Charge Change"))+
+  scale_fill_met_d("Hiroshige")
+charge_p
+
+hydro_p <- hydro_p + labs(fill = NULL)
+supp1 <- ggarrange(hydro_p,charge_p,nrow = 1, labels = LETTERS)
+supp1
+ggsave("outputs/Supplementary1.png", bg = "white", supp1, width = 10, height = 5, dpi = 300)
+
+filtered_data %>% 
+  group_by(Lymphoma) %>% 
+  mutate(change_type = case_when(
+    Hydrophobic_change == "Hydrophilic" ~ "Yes",
+    TRUE ~ "No"
+  ))->hydrophob_shm_stat
+
+ftable(hydrophob_shm_stat$Lymphoma,hydrophob_shm_stat$change_type) %>%
+  fisher_test() %>%
+  as_tibble() %>% 
+  {write_csv(., "outputs/hydrophobicity_fisher_test.csv"); knitr::kable(.)}
+
+####Supplementary 2: HCDR3s ####
+
+collated_HCDRs <- Biostrings::readAAStringSet("data/sequences/hcdr3_comparison.fasta")
+
+collated_HCDRs[names(collated_HCDRs) %>% str_detect("\\*")]
+collated_HCDRs[names(collated_HCDRs) %>% str_detect("\\*",negate = T)]
+msa::msaClustalW(collated_HCDRs) %>% Biostrings::AAMultipleAlignment()->msa_misc_hcdr
+supp2 <- ggmsa::ggmsa(msa_misc_hcdr,
+             color = "Zappo_AA",
+             consensus_views = T,
+             by_conservation = F,
+             seq_name = T,
+             ignore_gaps = F,
+)+
+  geom_seqlogo()+
+  theme_pubr()+
+  scale_x_continuous(breaks = c(0,4,8,12,16,20),expand = expansion(add = c(0,0)))+
+  theme(axis.line.y = element_blank())
+
+supp2
+ggsave("outputs/Supplementary2.png", bg = "white", supp2, width = 12, height = 9, dpi = 300)
+```
+
+## 12. Export data, statistics and reproducibility diagnostics
+
+CSV exports retain participant codes as text. When opening them in a spreadsheet,
+import identifier columns as text to avoid losing leading zeros. Statistical
+annotations are computed when the plots are built; their layer tables are exported
+separately, including non-significant tests hidden in the displayed figures.
+Bracket layer tables repeat each test for its three drawn segments; deduplicate
+by panel, group pair and p-value when using these as statistical summaries.
+
+```{r export-data}
+tables <- list(participant_summary = pt_summary, parsed_residues = results_shm,
+  mutation_changes = shm_changes, complete_data = complete_data,
+  filtered_data = filtered_data, figure1_proportions = p_1_3_data,
+  figure1_significant_fisher_tests = p_1_3_stats,
+  figure2_shm_number = shm_number, figure2_ighv169 = shm_number_1_69_only,
+  figure2_peptide_proportions = d_mutations_per_peptide,
+  figure2_hotspots = d_mutation_hot_spots,
+  interface_contacts = extended_contacts)
+for (nm in names(tables)) write_csv(tables[[nm]], file.path("outputs", paste0(nm, ".csv")))
+all_fisher_tests <- p_1_3_data %>%
+  pivot_wider(names_from = n_sf, values_from = n_, values_fn = as.numeric) %>%
+  column_to_rownames("Pre-Lymphoma") %>%
+  pairwise_fisher_test(p.adjust.method = "bonferroni")
+write_csv(all_fisher_tests, "outputs/figure1_all_fisher_tests.csv")
+for (ch in names(msa_data)) {
+  Biostrings::writeXStringSet(msa_data[[ch]]$aligned, file.path("outputs", paste0(ch, "_aligned.fasta")))
+  for (nm in names(msa_data[[ch]]$ddg_aligned))
+    write_csv(msa_data[[ch]]$ddg_aligned[[nm]], file.path("outputs", paste0(ch, "_", nm, "_ddg.csv")))
+}
+plots <- list(rf_level = p_rf_level, subfamily_count = repertoire_p2,
+  shm_per_subfamily = shm_num_persf_p, shm_ighv169 = p_shm_number_1_69_only,
+  peptide_proportion = p_mutations_per_peptide, interface = fig_4)
+for (nm in names(plots)) {
+  # Export non-significant tests too, without changing the displayed figures.
+  export_plot <- plots[[nm]]
+  export_plot$layers <- lapply(export_plot$layers, function(layer) {
+    params <- layer$stat_params
+    if (!is.null(params$hide.ns)) params$hide.ns <- FALSE
+    ggplot2::ggproto(NULL, layer, stat_params = params)
+  })
+  layers <- ggplot_build(export_plot)$data
+  for (j in seq_along(layers)) {
+    if (any(grepl("^p($|[.])", names(layers[[j]]))))
+      write_csv(layers[[j]], file.path("outputs", paste0("statistics_", nm, "_layer", j, ".csv")))
+  }
+}
+# A short ID may recur across cohorts; only the full key identifies a peptide.
+id_audit <- results_shm %>% distinct(peptide_unique_id, pt, Lymphoma) %>%
+  count(peptide_unique_id, name = "participant_cohort_combinations") %>%
+  filter(participant_cohort_combinations > 1)
+write_csv(id_audit, "outputs/reused_local_peptide_ids.csv")
+composite_audit <- d_mutations_per_peptide %>%
+  count(Lymphoma, pt, peptide_unique_id, name = "summary_rows") %>%
+  filter(summary_rows > 1)
+write_csv(composite_audit, "outputs/duplicate_composite_peptide_keys.csv")
+threshold_audit <- filtered_data %>%
+  filter(is.na(specific_aa_mut_coverage) | is.na(specific_mut_proportion) |
+           specific_aa_mut_coverage <= 1 | specific_mut_proportion <= 0.1)
+write_csv(threshold_audit, "outputs/nonqualifying_retained_rows.csv")
+stopifnot(nrow(composite_audit) == 0L, nrow(threshold_audit) == 0L,
+          nrow(shm_number) == nrow(pt_summary))
+audit <- tibble(metric = c("Participants", "Parsed residue observations",
+  "Qualifying mutation rows", "Nonqualifying retained rows",
+  "Reused local peptide IDs (expected; not composite-key collisions)",
+  "Peptide summaries using composite keys", "Duplicate composite peptide keys"),
+  value = c(nrow(pt_summary), nrow(results_shm), nrow(filtered_data),
+            nrow(threshold_audit), nrow(id_audit), nrow(d_mutations_per_peptide),
+            nrow(composite_audit)))
+write_csv(audit, "outputs/run_summary.csv")
+knitr::kable(audit)
+writeLines(capture.output(sessionInfo()), "outputs/session_info.txt")
+saveRDS(tables, "outputs/analysis_tables.rds")
+```
+
+## Notes
+
+RF units are IU/L. Peptide-level tests do not model within-participant clustering.
+Supplemental counts distinguish unfiltered records from qualifying mutations.
+Setup and data terms are in `README.md`.
+
+```{r session-info}
+sessionInfo()
+```

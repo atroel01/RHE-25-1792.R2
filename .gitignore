@@ -1,0 +1,15 @@
+.DS_Store
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+renv/
+analysis_files/
+analysis.knit.md
+analysis.utf8.md
+*.log
+
+# Locally generated reports and results
+/analysis.html
+/outputs/
+/provenance/
